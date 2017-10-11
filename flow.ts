@@ -14,19 +14,24 @@
  * the License.
  */
 
-import {AuthorizationRequest} from '@openid/appauth/built/authorization_request';
-import {AuthorizationNotifier, AuthorizationRequestHandler, AuthorizationRequestResponse, BUILT_IN_PARAMETERS} from '@openid/appauth/built/authorization_request_handler';
-import {AuthorizationResponse} from '@openid/appauth/built/authorization_response';
-import {AuthorizationServiceConfiguration} from '@openid/appauth/built/authorization_service_configuration';
-import {NodeBasedHandler} from '@openid/appauth/built/node_support/node_request_handler';
-import {NodeRequestor} from '@openid/appauth/built/node_support/node_requestor';
-import {GRANT_TYPE_AUTHORIZATION_CODE, GRANT_TYPE_REFRESH_TOKEN, TokenRequest} from '@openid/appauth/built/token_request';
-import {BaseTokenRequestHandler, TokenRequestHandler} from '@openid/appauth/built/token_request_handler';
-import {TokenError, TokenResponse} from '@openid/appauth/built/token_response';
+import { AuthorizationRequest } from '@openid/appauth/built/authorization_request';
+import { AuthorizationNotifier, AuthorizationRequestHandler, AuthorizationRequestResponse, BUILT_IN_PARAMETERS } from '@openid/appauth/built/authorization_request_handler';
+import { AuthorizationResponse } from '@openid/appauth/built/authorization_response';
+import { AuthorizationServiceConfiguration } from '@openid/appauth/built/authorization_service_configuration';
+import { NodeBasedHandler } from '@openid/appauth/built/node_support/node_request_handler';
+import { NodeRequestor } from '@openid/appauth/built/node_support/node_requestor';
+import { GRANT_TYPE_AUTHORIZATION_CODE, GRANT_TYPE_REFRESH_TOKEN, TokenRequest } from '@openid/appauth/built/token_request';
+import { BaseTokenRequestHandler, TokenRequestHandler } from '@openid/appauth/built/token_request_handler';
+import { TokenError, TokenResponse } from '@openid/appauth/built/token_response';
 import EventEmitter = require('events');
 
-import {log} from './logger';
-import {StringMap} from '@openid/appauth/built/types';
+import { log } from './logger';
+import { StringMap } from '@openid/appauth/built/types';
+import { CodeVerifier } from './code_verifier';
+import { ElectronBrowserWindowRequestHandler } from './electron_browser_window_request_handler';
+
+import * as path from 'path';
+import { Config } from './config-loader';
 
 export class AuthStateEmitter extends EventEmitter {
   static ON_TOKEN_RESPONSE = 'on_token_response';
@@ -35,128 +40,133 @@ export class AuthStateEmitter extends EventEmitter {
 /* the Node.js based HTTP client. */
 const requestor = new NodeRequestor();
 
-/* an example open id connect provider */
-const openIdConnectUrl = 'https://accounts.google.com';
-
-/* example client configuration */
-const clientId =
-    '511828570984-7nmej36h9j2tebiqmpqh835naet4vci4.apps.googleusercontent.com';
-const redirectUri = 'http://127.0.0.1:8000';
-const scope = 'openid';
-
 export class AuthFlow {
-  private notifier: AuthorizationNotifier;
-  private authorizationHandler: AuthorizationRequestHandler;
-  private tokenHandler: TokenRequestHandler;
-  readonly authStateEmitter: AuthStateEmitter;
+  private _notifier: AuthorizationNotifier;
+  private _authorizationHandler: ElectronBrowserWindowRequestHandler;
+  private _tokenHandler: TokenRequestHandler;
+  private _authServiceConfig: AuthorizationServiceConfiguration;
+  private _config: Config;
 
-  // state
-  private configuration: AuthorizationServiceConfiguration|null;
+  private _accessTokenResponse: TokenResponse | undefined;
+  private _verifier: CodeVerifier;
 
-  private refreshToken: string|undefined;
-  private accessTokenResponse: TokenResponse|null;
+  public refreshToken: string | undefined;
+  public accessToken: string | undefined;
 
-  constructor() {
-    this.notifier = new AuthorizationNotifier();
+  public readonly authStateEmitter: AuthStateEmitter;
+
+  public get isLoggedIn() {
+    return !!this._accessTokenResponse && this._accessTokenResponse.isValid();
+  }
+
+  constructor(config: Config, refreshToken?: string) {
+
+    this.refreshToken = refreshToken;
+
+    this._config = config;
+    this._verifier = new CodeVerifier();
+    this._notifier = new AuthorizationNotifier();
     this.authStateEmitter = new AuthStateEmitter();
-    this.authorizationHandler = new NodeBasedHandler();
-    this.tokenHandler = new BaseTokenRequestHandler(requestor);
+
+    //TODO:DIW:Associate a method of obtaining a electron browser, eg creating a BrowserWindow, or using a WebView.
+    this._authorizationHandler = new ElectronBrowserWindowRequestHandler({
+      title: 'Login',
+      width: 800,
+      height: 600,
+      icon: 'assets/app_icon.png',
+      webPreferences: { nodeIntegration: false }
+    });
+
+    this._tokenHandler = new BaseTokenRequestHandler(requestor);
+
     // set notifier to deliver responses
-    this.authorizationHandler.setAuthorizationNotifier(this.notifier);
-    // set a listener to listen for authorization responses
-    // make refresh and access token requests.
-    this.notifier.setAuthorizationListener((request, response, error) => {
-      log('Authorization request complete ', request, response, error);
-      if (response) {
-        this.makeRefreshTokenRequest(response.code)
-            .then(result => this.performWithFreshTokens())
-            .then(() => {
-              this.authStateEmitter.emit(AuthStateEmitter.ON_TOKEN_RESPONSE);
-              log('All Done.');
-            })
-      }
+    this._authorizationHandler.setAuthorizationNotifier(this._notifier);
+
+    // set a listener to respond to authorization responses and make refresh and access token requests.
+    this._notifier.setAuthorizationListener(async (request, response, error) => {
+
+      if (!response) return;
+
+      await this.performTokenRequest(response.code);
+
+      this.authStateEmitter.emit(AuthStateEmitter.ON_TOKEN_RESPONSE);
     });
   }
 
-  fetchServiceConfiguration(): Promise<void> {
-    return AuthorizationServiceConfiguration
-        .fetchFromIssuer(openIdConnectUrl, requestor)
-        .then(response => {
-          log('Fetched service configuration', response);
-          this.configuration = response;
-        });
+  public async initialize() {
+
+    this._authServiceConfig = await AuthorizationServiceConfiguration.fetchFromIssuer(this._config.openidUri, requestor);
+
   }
 
-  makeAuthorizationRequest(username?: string) {
-    if (!this.configuration) {
-      log('Unknown service configuration');
-      return;
-    }
+  public signIn(username?: string) {
+    if (!this._authServiceConfig) throw new Error('Unknown service configuration');
 
-    const extras: StringMap = {'prompt': 'consent', 'access_type': 'offline'};
-    if (username) {
-      extras['login_hint'] = username;
+    let extras: StringMap = {
+      'prompt': 'consent',
+      'access_type': 'offline'
+    };
+
+    if (username) extras['login_hint'] = username;
+    if (this._config.clientSecret) extras['client_secret'] = this._config.clientSecret;
+
+    if (this._verifier) {
+      extras['code_challenge'] = this._verifier.challenge;
+      extras['code_challenge_method'] = this._verifier.method;
+      extras['code_verifier'] = this._verifier.verifier;
     }
 
     // create a request
-    const request = new AuthorizationRequest(
-        clientId, redirectUri, scope, AuthorizationRequest.RESPONSE_TYPE_CODE,
-        undefined /* state */, extras);
+    let authRequest = new AuthorizationRequest(this._config.clientId, this._config.redirectUri, this._config.scope, AuthorizationRequest.RESPONSE_TYPE_CODE, undefined, extras);
 
-    log('Making authorization request ', this.configuration, request);
-
-    this.authorizationHandler.performAuthorizationRequest(
-        this.configuration, request);
+    this._authorizationHandler.performAuthorizationRequest(this._authServiceConfig, authRequest);
   }
 
-  private makeRefreshTokenRequest(code: string): Promise<void> {
-    if (!this.configuration) {
-      log('Unknown service configuration');
-      return Promise.resolve();
-    }
-    // use the code to make the token request.
-    let request = new TokenRequest(
-        clientId, redirectUri, GRANT_TYPE_AUTHORIZATION_CODE, code, undefined);
-
-    return this.tokenHandler.performTokenRequest(this.configuration, request)
-        .then(response => {
-          log(`Refresh Token is ${response.refreshToken}`);
-          this.refreshToken = response.refreshToken;
-          this.accessTokenResponse = response;
-          return response;
-        })
-        .then(() => {});
+  public signOut() {
+    //TODO:Logout on server?
+    this._accessTokenResponse = undefined;
   }
 
-  loggedIn(): boolean {
-    return !!this.accessTokenResponse && this.accessTokenResponse.isValid();
+  private async performTokenRequest(code: string) {
+
+    if (!this._authServiceConfig) return Promise.reject('Unknown service configuration');
+
+    let extras: StringMap = {};
+
+    if (this._config.clientSecret) extras['client_secret'] = this._config.clientSecret;
+
+    if (this._verifier) {
+      extras['code_challenge'] = this._verifier.challenge;
+      extras['code_challenge_method'] = this._verifier.method;
+      extras['code_verifier'] = this._verifier.verifier;
+    }
+
+    let request = new TokenRequest(this._config.clientId, this._config.redirectUri, GRANT_TYPE_AUTHORIZATION_CODE, code, undefined, extras);
+
+    let response = await this._tokenHandler.performTokenRequest(this._authServiceConfig, request);
+
+    this._accessTokenResponse = response;
+
+    this.refreshToken = response.refreshToken;
+    this.accessToken = response.accessToken;
   }
 
-  signOut() {
-    // forget all cached token state
-    this.accessTokenResponse = null;
-  }
+  public async updateAccessToken() {
 
-  performWithFreshTokens(): Promise<string> {
-    if (!this.configuration) {
-      log('Unknown service configuration');
-      return Promise.reject('Unknown service configuration');
-    }
-    if (!this.refreshToken) {
-      log('Missing refreshToken.');
-      return Promise.resolve('Missing refreshToken.');
-    }
-    if (this.accessTokenResponse && this.accessTokenResponse.isValid()) {
-      // do nothing
-      return Promise.resolve(this.accessTokenResponse.accessToken);
-    }
-    let request = new TokenRequest(
-        clientId, redirectUri, GRANT_TYPE_REFRESH_TOKEN, undefined,
-        this.refreshToken);
-    return this.tokenHandler.performTokenRequest(this.configuration, request)
-        .then(response => {
-          this.accessTokenResponse = response;
-          return response.accessToken;
-        });
+    if (!this._authServiceConfig) throw new Error('Unknown service configuration');
+    if (!this.refreshToken) throw new Error('Missing refreshToken.');
+
+    if (this._accessTokenResponse && this._accessTokenResponse.isValid()) return;
+
+    let extras: StringMap = {};
+
+    if (this._config.clientSecret) extras['client_secret'] = this._config.clientSecret;
+
+    let request = new TokenRequest(this._config.clientId, this._config.redirectUri, GRANT_TYPE_REFRESH_TOKEN, undefined, this.refreshToken, extras);
+
+    let response = await this._tokenHandler.performTokenRequest(this._authServiceConfig, request);
+
+    this._accessTokenResponse = response;
+
   }
 }

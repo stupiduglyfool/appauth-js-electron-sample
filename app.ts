@@ -14,9 +14,12 @@
  * the License.
  */
 
-import {ipcRenderer} from 'electron';
-import {AuthFlow, AuthStateEmitter} from './flow';
-import {log} from './logger';
+import { ipcRenderer } from 'electron';
+import { AuthFlow, AuthStateEmitter } from './flow';
+import { log } from './logger';
+import { CodeVerifier } from './code_verifier';
+import { Md5 } from './md5';
+import { Config } from './config-loader';
 
 const SIGN_IN = 'Sign-In';
 const SIGN_OUT = 'Sign-Out';
@@ -36,101 +39,115 @@ interface UserInfo {
 }
 
 export class App {
-  private authFlow: AuthFlow = new AuthFlow();
-  private userInfo: UserInfo|null = null;
+  private _config: Config;
+  private _accessToken: string;
+  private _userInfo: UserInfo | null;
 
-  private handleSignIn =
-      document.querySelector('#handle-sign-in') as HTMLElement;
-
-  private fetchUserInfo =
-      document.querySelector('#handle-user-info') as HTMLElement;
-
-  private userCard = document.querySelector('#user-info') as HTMLElement;
-
-  private userProfileImage =
-      document.querySelector('#user-profile-image') as HTMLImageElement;
-
-  private userName = document.querySelector('#user-name') as HTMLElement;
-
-  private snackbarContainer: any =
-      document.querySelector('#appauth-snackbar') as HTMLElement;
+  private _handleSignIn = document.querySelector('#handle-sign-in') as HTMLElement;
+  private _fetchUserInfo = document.querySelector('#handle-user-info') as HTMLElement;
+  private _userCard = document.querySelector('#user-info') as HTMLElement;
+  private _userProfileImage = document.querySelector('#user-profile-image') as HTMLImageElement;
+  private _userName = document.querySelector('#user-name') as HTMLElement;
+  private _snackbarContainer: any = document.querySelector('#appauth-snackbar') as HTMLElement;
 
   constructor() {
+
     this.initializeUi();
-    this.handleSignIn.addEventListener('click', (event) => {
-      if (this.handleSignIn.textContent === SIGN_IN) {
+
+    ipcRenderer.on('config-loaded', (event: any, config: Config) => {
+      this._config = config;
+    });
+
+    ipcRenderer.on('signed-in', (event: any, message: string) => {
+
+      this._accessToken = message;
+      this.updateUi();
+
+    });
+
+    this._handleSignIn.addEventListener('click', (event) => {
+      if (this._handleSignIn.textContent === SIGN_IN) {
         this.signIn();
-      } else if (this.handleSignIn.textContent === SIGN_OUT) {
+      } else if (this._handleSignIn.textContent === SIGN_OUT) {
         this.signOut();
       }
       event.preventDefault();
     });
 
-    this.fetchUserInfo.addEventListener('click', () => {
-      this.authFlow.performWithFreshTokens().then(accessToken => {
-        let request =
-            new Request('https://www.googleapis.com/oauth2/v3/userinfo', {
-              headers: new Headers({'Authorization': `Bearer ${accessToken}`}),
-              method: 'GET',
-              cache: 'no-cache'
-            });
+    this._fetchUserInfo.addEventListener('click', () => {
 
-        fetch(request)
-            .then(result => result.json())
-            .then(user => {
-              log('User Info ', user);
-              this.userInfo = user;
-              this.updateUi();
-            })
-            .catch(error => {
-              log('Something bad happened ', error);
-            });
-      });
-    });
-
-    this.authFlow.authStateEmitter.on(
-        AuthStateEmitter.ON_TOKEN_RESPONSE, () => {
-          this.updateUi();
-          //  request app focus
-          ipcRenderer.send('app-focus');
+      let request =
+        new Request(`${this._config.openidUri}/connect/userinfo`, {
+          headers: new Headers({ 'Authorization': `Bearer ${this._accessToken}` }),
+          method: 'GET',
+          cache: 'no-cache'
         });
+
+      fetch(request)
+        .then(result => result.json())
+        .then(user => {
+          log('User Info ', user);
+          this._userInfo = user;
+          this.updateUi();
+        })
+        .catch(error => {
+          log('Something bad happened ', error);
+        });
+
+    });
   }
 
   signIn(username?: string): Promise<void> {
-    if (!this.authFlow.loggedIn()) {
-      return this.authFlow.fetchServiceConfiguration().then(
-          () => this.authFlow.makeAuthorizationRequest(username));
+    if (this._accessToken) return Promise.resolve();
+
+    ipcRenderer.send('sign-in');
+
+    return Promise.resolve();
+
+
+    /*return this.authFlow.fetchServiceConfiguration().then(
+        () => this.authFlow.makeAuthorizationRequest(username));
     } else {
       return Promise.resolve();
-    }
+    }*/
   }
 
   private initializeUi() {
-    this.handleSignIn.textContent = SIGN_IN;
-    this.fetchUserInfo.style.display = 'none';
-    this.userCard.style.display = 'none';
+    this._handleSignIn.textContent = SIGN_IN;
+    this._fetchUserInfo.style.display = 'none';
+    this._userCard.style.display = 'none';
   }
 
   // update ui post logging in.
   private updateUi() {
-    this.handleSignIn.textContent = SIGN_OUT;
-    this.fetchUserInfo.style.display = '';
-    if (this.userInfo) {
-      this.userProfileImage.src = `${this.userInfo.picture}?sz=96`;
-      this.userName.textContent = this.userInfo.name;
+    this._handleSignIn.textContent = SIGN_OUT;
+    this._fetchUserInfo.style.display = '';
+    if (this._userInfo) {
+
+
+      let md5 = new Md5();
+      md5.start();
+      md5.appendStr(this._userInfo.name.toLowerCase());
+      let hashedEmail = <string>md5.end(false);
+
+      this._userProfileImage.src = this._userInfo.picture
+        ? `${this._userInfo.picture}?sz=96`
+        : `https://www.gravatar.com/avatar/${hashedEmail}`;
+
+      this._userName.textContent = this._userInfo.name;
       this.showSnackBar(
-          {message: `Welcome ${this.userInfo.name}`, timeout: 4000});
-      this.userCard.style.display = '';
+        { message: `Welcome ${this._userInfo.name}`, timeout: 4000 });
+      this._userCard.style.display = '';
     }
   }
 
   private showSnackBar(data: SnackBarOptions) {
-    this.snackbarContainer.MaterialSnackbar.showSnackbar(data);
+    this._snackbarContainer.MaterialSnackbar.showSnackbar(data);
   }
 
   signOut() {
-    this.authFlow.signOut();
-    this.userInfo = null;
+    ipcRenderer.send('sign-out');
+    this._userInfo = null;
     this.initializeUi();
   }
 }

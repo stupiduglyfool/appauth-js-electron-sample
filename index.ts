@@ -14,48 +14,66 @@
  * the License.
  */
 
-import {app, BrowserWindow, ipcMain} from 'electron';
+import { app, BrowserWindow, ipcMain } from 'electron';
 import url = require('url');
 import path = require('path');
-import {log} from './logger';
+import { log } from './logger';
+import { AuthFlow, AuthStateEmitter } from './flow';
+import { ConfigLoader } from './config-loader';
+
 
 // retain a reference to the window, otherwise it gets gc-ed
-let w: Electron.BrowserWindow|null = null;
+let mainWindow: Electron.BrowserWindow;
+let authFlow: AuthFlow;
 
-function createWindow(): Electron.BrowserWindow {
-  log('Creating window.');
-  w = new BrowserWindow(
-      {width: 1280, height: 720, icon: 'assets/app_icon.png'});
-  w.loadURL(url.format({
+ipcMain.on('app-focus', () => app.focus());
+ipcMain.on('sign-in', async (event: any, arg: any) => await authFlow.signIn());
+ipcMain.on('sign-out', (event: any, arg: any) => authFlow.signOut());
+
+const createMainWindow = async () => {
+
+  let config = await ConfigLoader.execute();
+
+  if (config.disableSslCheck) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+  authFlow = new AuthFlow(config);
+
+  await authFlow.initialize();
+
+  authFlow.authStateEmitter.on(AuthStateEmitter.ON_TOKEN_RESPONSE, async () => {
+    let x = mainWindow as Electron.BrowserWindow;
+    x.webContents.send('signed-in', authFlow.accessToken);
+    app.focus();
+  });
+
+  mainWindow = new BrowserWindow({
+    width: 1280,
+    height: 720,
+    icon: 'assets/app_icon.png',
+    show: false
+  });
+
+  mainWindow.on('close', () => mainWindow.destroy());
+  mainWindow.on('ready-to-show', () => {
+    mainWindow.webContents.send('config-loaded', config);
+    mainWindow.show();
+  });
+
+  mainWindow.loadURL(url.format({
     pathname: path.join(path.dirname(__dirname), 'index.html'),
     protocol: 'file:',
     slashes: true
   }));
-  w.on('close', () => {
-    // allow window to be gc-ed
-    w = null;
-  });
-  ipcMain.on('app-focus', () => {
-    log('Main process is gaining focus');
-    app.focus();
-  });
-  return w;
+
+  return mainWindow;
 }
 
-app.on('ready', createWindow);
+app.on('ready', async () => await createMainWindow());
 
 app.on('window-all-closed', () => {
-  log('All windows closed');
-  // On macOS it is common for applications and their menu bar
-  // to stay active until the user quits explicitly with Cmd + Q
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
+  if (process.platform !== 'darwin') app.quit()
 });
 
-app.on('activate', () => {
-  if (w === null) {
-    log('Creating a new window');
-    w = createWindow();
-  }
+app.on('activate', async () => {
+  if (mainWindow === null) mainWindow = await createMainWindow();
 });

@@ -28,7 +28,7 @@ import EventEmitter = require('events');
 import { log } from './logger';
 import { StringMap } from '@openid/appauth/built/types';
 import { CodeVerifier } from './code_verifier';
-import { ElectronBrowserWindowRequestHandler } from './electron_browser_window_request_handler';
+import { ElectronRequestHandler, ElectronBrowserWindowBehavior, IElectronTokenRequestBehavior } from './electron_request_handler';
 
 import * as path from 'path';
 import { Config } from './config-loader';
@@ -42,15 +42,13 @@ const requestor = new NodeRequestor();
 
 export class AuthFlow {
   private _notifier: AuthorizationNotifier;
-  private _authorizationHandler: ElectronBrowserWindowRequestHandler;
+  private _authorizationHandler: ElectronRequestHandler;
   private _tokenHandler: TokenRequestHandler;
   private _authServiceConfig: AuthorizationServiceConfiguration;
-  private _config: Config;
 
   private _accessTokenResponse: TokenResponse | undefined;
   private _verifier: CodeVerifier;
 
-  public refreshToken: string | undefined;
   public accessToken: string | undefined;
 
   public readonly authStateEmitter: AuthStateEmitter;
@@ -59,23 +57,16 @@ export class AuthFlow {
     return !!this._accessTokenResponse && this._accessTokenResponse.isValid();
   }
 
-  constructor(config: Config, refreshToken?: string) {
+  constructor(
+    private _config: Config,
+    private _authBehavior: IElectronTokenRequestBehavior,
+    public refreshToken?: string) {
 
-    this.refreshToken = refreshToken;
-
-    this._config = config;
     this._verifier = new CodeVerifier();
     this._notifier = new AuthorizationNotifier();
     this.authStateEmitter = new AuthStateEmitter();
 
-    //TODO:DIW:Associate a method of obtaining a electron browser, eg creating a BrowserWindow, or using a WebView.
-    this._authorizationHandler = new ElectronBrowserWindowRequestHandler({
-      title: 'Login',
-      width: 800,
-      height: 600,
-      icon: 'assets/app_icon.png',
-      webPreferences: { nodeIntegration: false }
-    });
+    this._authorizationHandler = new ElectronRequestHandler(_authBehavior);
 
     this._tokenHandler = new BaseTokenRequestHandler(requestor);
 
@@ -93,14 +84,20 @@ export class AuthFlow {
     });
   }
 
-  public async initialize() {
+  private async getAuthServiceConfig() {
 
-    this._authServiceConfig = await AuthorizationServiceConfiguration.fetchFromIssuer(this._config.openidUri, requestor);
+    if (!this._authServiceConfig) {
+      this._authServiceConfig = await AuthorizationServiceConfiguration.fetchFromIssuer(this._config.openidUri, requestor);
+    }
+
+    return this._authServiceConfig;
 
   }
 
-  public signIn(username?: string) {
-    if (!this._authServiceConfig) throw new Error('Unknown service configuration');
+  public async signIn(username?: string) {
+
+    let authServiceConfig = await this.getAuthServiceConfig();
+    if (!authServiceConfig) throw new Error('Unknown service configuration');
 
     let extras: StringMap = {
       'prompt': 'consent',
@@ -119,17 +116,19 @@ export class AuthFlow {
     // create a request
     let authRequest = new AuthorizationRequest(this._config.clientId, this._config.redirectUri, this._config.scope, AuthorizationRequest.RESPONSE_TYPE_CODE, undefined, extras);
 
-    this._authorizationHandler.performAuthorizationRequest(this._authServiceConfig, authRequest);
+    this._authorizationHandler.performAuthorizationRequest(authServiceConfig, authRequest);
   }
 
   public signOut() {
-    //TODO:Logout on server?
+    //TODO:Logout on server?    
+    this.accessToken = undefined;
     this._accessTokenResponse = undefined;
   }
 
   private async performTokenRequest(code: string) {
 
-    if (!this._authServiceConfig) return Promise.reject('Unknown service configuration');
+    let authServiceConfig = await this.getAuthServiceConfig();
+    if (!authServiceConfig) throw new Error('Unknown service configuration');
 
     let extras: StringMap = {};
 
@@ -143,7 +142,7 @@ export class AuthFlow {
 
     let request = new TokenRequest(this._config.clientId, this._config.redirectUri, GRANT_TYPE_AUTHORIZATION_CODE, code, undefined, extras);
 
-    let response = await this._tokenHandler.performTokenRequest(this._authServiceConfig, request);
+    let response = await this._tokenHandler.performTokenRequest(authServiceConfig, request);
 
     this._accessTokenResponse = response;
 
@@ -153,7 +152,9 @@ export class AuthFlow {
 
   public async updateAccessToken() {
 
-    if (!this._authServiceConfig) throw new Error('Unknown service configuration');
+    let authServiceConfig = await this.getAuthServiceConfig();
+    if (!authServiceConfig) throw new Error('Unknown service configuration');
+
     if (!this.refreshToken) throw new Error('Missing refreshToken.');
 
     if (this._accessTokenResponse && this._accessTokenResponse.isValid()) return;
@@ -164,7 +165,7 @@ export class AuthFlow {
 
     let request = new TokenRequest(this._config.clientId, this._config.redirectUri, GRANT_TYPE_REFRESH_TOKEN, undefined, this.refreshToken, extras);
 
-    let response = await this._tokenHandler.performTokenRequest(this._authServiceConfig, request);
+    let response = await this._tokenHandler.performTokenRequest(authServiceConfig, request);
 
     this._accessTokenResponse = response;
 

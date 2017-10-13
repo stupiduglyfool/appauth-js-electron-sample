@@ -20,6 +20,7 @@ import { log } from './logger';
 import { CodeVerifier } from './code_verifier';
 import { Md5 } from './md5';
 import { Config } from './config-loader';
+import { ElectronWebviewBehavior } from './electron_request_handler';
 
 const SIGN_IN = 'Sign-In';
 const SIGN_OUT = 'Sign-Out';
@@ -39,11 +40,12 @@ interface UserInfo {
 }
 
 export class App {
+  private _authFlow: AuthFlow;
   private _config: Config;
-  private _accessToken: string;
   private _userInfo: UserInfo | null;
 
   private _handleSignIn = document.querySelector('#handle-sign-in') as HTMLElement;
+  private _authView = document.querySelector('#authView') as HTMLElement;
   private _fetchUserInfo = document.querySelector('#handle-user-info') as HTMLElement;
   private _userCard = document.querySelector('#user-info') as HTMLElement;
   private _userProfileImage = document.querySelector('#user-profile-image') as HTMLImageElement;
@@ -56,14 +58,19 @@ export class App {
 
     ipcRenderer.on('config-loaded', (event: any, config: Config) => {
       this._config = config;
+
+      let behavior = new ElectronWebviewBehavior(this._authView as Electron.WebviewTag)
+
+      //TODO:retreive refresh token from storage.
+
+      this._authFlow = new AuthFlow(config, behavior);
+
+      this._authFlow.authStateEmitter.on(AuthStateEmitter.ON_TOKEN_RESPONSE, async () => {
+        this.updateUi();
+        ipcRenderer.send('app-focus');
+      });
     });
 
-    ipcRenderer.on('signed-in', (event: any, message: string) => {
-
-      this._accessToken = message;
-      this.updateUi();
-
-    });
 
     this._handleSignIn.addEventListener('click', (event) => {
       if (this._handleSignIn.textContent === SIGN_IN) {
@@ -78,7 +85,7 @@ export class App {
 
       let request =
         new Request(`${this._config.openidUri}/connect/userinfo`, {
-          headers: new Headers({ 'Authorization': `Bearer ${this._accessToken}` }),
+          headers: new Headers({ 'Authorization': `Bearer ${this._authFlow.accessToken}` }),
           method: 'GET',
           cache: 'no-cache'
         });
@@ -97,19 +104,10 @@ export class App {
     });
   }
 
-  signIn(username?: string): Promise<void> {
-    if (this._accessToken) return Promise.resolve();
+  public async signIn(username?: string) {
+    if (this._authFlow.accessToken) return;
 
-    ipcRenderer.send('sign-in');
-
-    return Promise.resolve();
-
-
-    /*return this.authFlow.fetchServiceConfiguration().then(
-        () => this.authFlow.makeAuthorizationRequest(username));
-    } else {
-      return Promise.resolve();
-    }*/
+    await this._authFlow.signIn(username);
   }
 
   private initializeUi() {
@@ -146,7 +144,7 @@ export class App {
   }
 
   signOut() {
-    ipcRenderer.send('sign-out');
+    this._authFlow.signOut();
     this._userInfo = null;
     this.initializeUi();
   }

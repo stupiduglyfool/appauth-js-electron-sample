@@ -18,33 +18,19 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import url = require('url');
 import path = require('path');
 import { log } from './logger';
-import { AuthFlow, AuthStateEmitter } from './flow';
 import { ConfigLoader } from './config-loader';
 
 
 // retain a reference to the window, otherwise it gets gc-ed
 let mainWindow: Electron.BrowserWindow;
-let authFlow: AuthFlow;
 
 ipcMain.on('app-focus', () => app.focus());
-ipcMain.on('sign-in', async (event: any, arg: any) => await authFlow.signIn());
-ipcMain.on('sign-out', (event: any, arg: any) => authFlow.signOut());
 
 const createMainWindow = async () => {
 
   let config = await ConfigLoader.execute();
 
   if (config.disableSslCheck) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
-  authFlow = new AuthFlow(config);
-
-  await authFlow.initialize();
-
-  authFlow.authStateEmitter.on(AuthStateEmitter.ON_TOKEN_RESPONSE, async () => {
-    let x = mainWindow as Electron.BrowserWindow;
-    x.webContents.send('signed-in', authFlow.accessToken);
-    app.focus();
-  });
 
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -54,6 +40,7 @@ const createMainWindow = async () => {
   });
 
   mainWindow.on('close', () => mainWindow.destroy());
+
   mainWindow.on('ready-to-show', () => {
     mainWindow.webContents.send('config-loaded', config);
     mainWindow.show();

@@ -21,23 +21,86 @@ import { AuthorizationError, AuthorizationResponse, AuthorizationResponseJson, A
 import { AuthorizationServiceConfiguration } from '@openid/appauth/built/authorization_service_configuration';
 import { log } from '@openid/appauth/built/logger';
 
-
-import { BrowserWindow, BrowserWindowConstructorOptions } from 'electron';
+import { WebviewTag, BrowserWindow, BrowserWindowConstructorOptions } from 'electron';
 
 class ServerEventsEmitter extends EventEmitter {
     static ON_AUTHORIZATION_RESPONSE = 'authorization_response';
     static ON_AUTHORIZATION_ERROR = 'authorization_error';
 }
 
-export class ElectronBrowserWindowRequestHandler extends AuthorizationRequestHandler {
+export interface IElectronTokenRequestBehavior {
+    begin(): void;
+    loadUrl(url: string): void;
 
-    private _authWindow: BrowserWindow;
+    getWebContents(): Electron.WebContents;
+
+    complete(): void;
+}
+
+export class ElectronWebviewBehavior implements IElectronTokenRequestBehavior {
+
+    constructor(private _webview: Electron.WebviewTag | null) { }
+
+    public begin() { }
+
+    public loadUrl(url: string) {
+        let webview = this._webview as Electron.WebviewTag;
+        webview.loadURL(url);
+    }
+
+    public getWebContents() {
+        let webview = this._webview as Electron.WebviewTag;
+        return webview.getWebContents();
+    }
+
+
+    public complete() {
+        let webview = this._webview as Electron.WebviewTag;
+
+        if (webview) webview.getWebContents().removeAllListeners();
+    }
+}
+
+export class ElectronBrowserWindowBehavior implements IElectronTokenRequestBehavior {
+    private _authWindow: BrowserWindow | null;
+
+    constructor(private _options?: BrowserWindowConstructorOptions) { }
+
+    public begin() {
+        this._authWindow = new BrowserWindow(this._options);
+
+        this._authWindow.on('closed', () => {
+            let browserWindow = this._authWindow as BrowserWindow;
+            browserWindow.removeAllListeners();
+        });
+    }
+
+    public loadUrl(url: string) {
+        let browserWindow = this._authWindow as BrowserWindow;
+        browserWindow.loadURL(url);
+    }
+
+    public getWebContents() {
+        let browserWindow = this._authWindow as BrowserWindow;
+        return browserWindow.webContents;
+    }
+
+    public complete() {
+        let browserWindow = this._authWindow as BrowserWindow;
+        browserWindow.destroy();
+
+        this._authWindow = null;
+    }
+}
+export class ElectronRequestHandler extends AuthorizationRequestHandler {
 
     // the handle to the current authorization request
     public authorizationPromise: Promise<AuthorizationRequestResponse | null> | null;
 
+    constructor(
+        private _tokenRequestBehavior: IElectronTokenRequestBehavior,
+        utils?: QueryStringUtils) {
 
-    constructor(private _options?: BrowserWindowConstructorOptions, utils?: QueryStringUtils) {
         super(utils || new BasicQueryStringUtils());
 
         this.authorizationPromise = null;
@@ -63,7 +126,8 @@ export class ElectronBrowserWindowRequestHandler extends AuthorizationRequestHan
             authorizationError = new AuthorizationError(error, errorDescription, errorUri, state);
 
             emitter.emit(ServerEventsEmitter.ON_AUTHORIZATION_ERROR, authorizationError);
-            this._authWindow.destroy();
+
+            this._tokenRequestBehavior.complete();
 
             return;
         }
@@ -79,14 +143,13 @@ export class ElectronBrowserWindowRequestHandler extends AuthorizationRequestHan
         } as AuthorizationRequestResponse;
 
         emitter.emit(ServerEventsEmitter.ON_AUTHORIZATION_RESPONSE, completeResponse);
-        this._authWindow.destroy();
+        this._tokenRequestBehavior.complete();
 
     }
 
     public performAuthorizationRequest(configuration: AuthorizationServiceConfiguration, request: AuthorizationRequest) {
 
-        this._authWindow = new BrowserWindow(this._options);
-        const emitter = new ServerEventsEmitter();
+        let emitter = new ServerEventsEmitter();
 
         this.authorizationPromise = new Promise<AuthorizationRequestResponse>((resolve, reject) => {
             emitter.once(ServerEventsEmitter.ON_AUTHORIZATION_RESPONSE, (result: any) => {
@@ -97,21 +160,22 @@ export class ElectronBrowserWindowRequestHandler extends AuthorizationRequestHan
             });
         });
 
-        this._authWindow.webContents.on('will-navigate', (event, url) => {
+
+        this._tokenRequestBehavior.begin();
+
+        this._tokenRequestBehavior.loadUrl(this.buildRequestUrl(configuration, request));
+
+        let webContents = this._tokenRequestBehavior.getWebContents();
+
+
+        webContents.on('will-navigate', (event, url) => {
             this.handleNavigation(emitter, url);
         });
 
-        this._authWindow.webContents.on('did-get-redirect-request', (event, oldUrl, newUrl) => {
+        webContents.on('did-get-redirect-request', (event, oldUrl, newUrl) => {
             this.handleNavigation(emitter, newUrl);
         });
 
-        this._authWindow.on('closed', () => {
-            this._authWindow.removeAllListeners();
-        });
-
-        let url = this.buildRequestUrl(configuration, request);
-
-        this._authWindow.loadURL(url);
     }
 
     protected completeAuthorizationRequest(): Promise<AuthorizationRequestResponse | null> {
